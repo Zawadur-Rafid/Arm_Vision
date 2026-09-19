@@ -9,9 +9,11 @@ Default run (``python servo_angle_mapper.py``) does a single shot:
      table to (lower, base, upper) servo angles and print them.
 
 Pipeline details (per selected tag):
-   1. Selection uses raw floats, BEFORE truncation (done inside
+   1. Selection uses raw floats, BEFORE rounding (done inside
       aruco_base_relative for the camera path).
-   2. Truncate selected X,Y toward zero (math.trunc).
+   2. Round selected X,Y to nearest int, half toward zero:
+      frac > 0.5 away from zero, frac <= 0.5 toward zero
+      (30.6->31, 30.2->30, 30.5->30, -2.3->-2, -3.7->-4, -2.5->-2).
    3. Map X by floor: largest calibration X <= X_processed.
    4. Map Y by nearest neighbour among rows with X == X_map.
       Tie -> smaller Y (deterministic).
@@ -24,7 +26,13 @@ continuous-preview mode (camera stays open).
 """
 
 import math
+import time
 from pathlib import Path
+
+try:
+    import serial  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover - optional dependency for hardware mode.
+    serial = None
 
 # ---------------------------------------------------------------------------
 # Calibration dataset (SL, X, Y, Lower, Base, Upper). Angles in degrees.
@@ -32,67 +40,77 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 # (sl, x, y, lower, base, upper)
 CALIBRATION_ROWS = [
-    (1, 33, 2, 160, 70, 50),
-    (2, 33, -1, 150, 80, 55),
-    (3, 33, -4, 155, 93, 50),
-    (4, 32, -7, 160, 105, 55),
-    (5, 30, 2, 140, 70, 40),
-    (6, 29, 0, 140, 80, 40),
-    (7, 29, -4, 140, 93, 40),
-    (8, 29, -7, 140, 107, 40),
-    (9, 26, 3, 130, 65, 30),
-    (10, 26, 0, 130, 80, 30),
-    (11, 26, -3, 130, 93, 30),
+    (1, 34, 2, 160, 70, 50),
+    (2, 34, -1, 150, 80, 55),
+    (3, 34, -5, 155, 93, 50),
+    (4, 33, -8, 160, 105, 55),
+    (5, 31, 2, 140, 70, 40),
+    (6, 30, -1, 140, 80, 40),
+    (7, 30, -4, 140, 93, 40),
+    (8, 30, -8, 140, 107, 40),
+    (9, 27, 3, 130, 65, 30),
+    (10, 27, 0, 130, 80, 30),
+    (11, 27, -4, 130, 93, 30),
     (12, 26, -7, 130, 107, 30),
-    (13, 23, 4, 125, 65, 30),
-    (14, 23, 0, 125, 80, 25),
-    (15, 23, -3, 125, 93, 20),
-    (16, 23, -6, 127, 112, 20),
-    (17, 33, 0, 160, 75, 50),
-    (18, 33, -2, 155, 85, 50),
-    (19, 33, -5, 160, 100, 55),
-    (20, 30, 1, 140, 75, 40),
-    (21, 29, -2, 140, 85, 40),
-    (22, 29, -5, 140, 97, 40),
-    (23, 26, 1, 130, 70, 30),
-    (24, 26, -1, 135, 85, 25),
-    (25, 26, -5, 135, 100, 30),
-    (26, 23, 2, 125, 70, 25),
-    (27, 23, -1, 125, 85, 25),
-    (28, 23, -4, 127, 100, 20),
-    (29, 31, 2, 160, 70, 50),
-    (30, 31, -1, 150, 83, 45),
-    (31, 31, -4, 150, 93, 45),
-    (32, 31, -7, 150, 105, 50),
-    (33, 28, 3, 140, 67, 40),
-    (34, 28, 0, 140, 80, 35),
-    (35, 27, -3, 135, 93, 30),
-    (36, 27, -7, 135, 110, 35),
-    (37, 25, 3, 125, 67, 30),
-    (38, 24, 0, 130, 80, 25),
-    (39, 24, -3, 130, 93, 20),
-    (40, 23, -6, 130, 110, 20),
+    (13, 25, 3, 125, 65, 30),
+    (14, 24, 0, 125, 80, 25),
+    (15, 24, -4, 125, 93, 20),
+    (16, 24, -7, 127, 112, 20),
+    (17, 34, 0, 160, 75, 50),
+    (18, 34, -3, 155, 85, 50),
+    (19, 33, -6, 160, 100, 55),
+    (20, 31, 1, 140, 75, 40),
+    (21, 30, -2, 140, 85, 40),
+    (22, 30, -6, 140, 97, 40),
+    (23, 27, 1, 130, 70, 30),
+    (24, 27, -2, 135, 85, 25),
+    (25, 26, -6, 135, 100, 30),
+    (26, 25, 2, 125, 70, 25),
+    (27, 24, -2, 125, 85, 25),
+    (28, 24, -5, 127, 100, 20),
+    (29, 32, 2, 160, 70, 50),
+    (30, 32, -1, 150, 83, 45),
+    (31, 32, -5, 150, 93, 45),
+    (32, 32, -8, 150, 105, 50),
+    (33, 29, 3, 140, 67, 40),
+    (34, 29, -1, 140, 80, 35),
+    (35, 28, -4, 135, 93, 30),
+    (36, 28, -7, 135, 110, 35),
+    (37, 26, 3, 125, 67, 30),
+    (38, 25, 0, 130, 80, 25),
+    (39, 25, -4, 130, 93, 20),
+    (40, 24, -7, 130, 110, 20),
     (41, 32, 1, 155, 75, 50),
-    (42, 31, -2, 140, 90, 45),
-    (43, 31, -5, 150, 100, 40),
-    (44, 28, 1, 135, 73, 35),
-    (45, 28, -1, 130, 90, 40),
-    (46, 27, -5, 135, 100, 30),
-    (47, 24, 2, 130, 73, 30),
-    (48, 24, -1, 125, 90, 20),
-    (49, 24, -4, 130, 100, 20),
+    (42, 32, -3, 140, 90, 45),
+    (43, 32, -6, 150, 100, 40),
+    (44, 29, 1, 135, 73, 35),
+    (45, 28, -2, 130, 90, 40),
+    (46, 28, -6, 135, 100, 30),
+    (47, 26, 1, 130, 73, 30),
+    (48, 25, -2, 125, 90, 20),
+    (49, 25, -5, 130, 100, 20),
 ]
 
 # Precomputed lookup structures.
 SORTED_XS = sorted({r[1] for r in CALIBRATION_ROWS})
-# (x, y) -> first row with that key (lowest SL wins on duplicates,
-# e.g. (23, -6) appears as SL16 and SL40; SL16 is kept).
+# (x, y) -> first row with that key (lowest SL wins on duplicates).
 ROW_BY_XY = {}
 for _sl, _x, _y, _lo, _ba, _up in sorted(CALIBRATION_ROWS, key=lambda r: r[0]):
     ROW_BY_XY.setdefault((_x, _y), (_lo, _ba, _up))
 # x -> sorted unique y values present for that x.
 YS_BY_X = {x: sorted({r[2] for r in CALIBRATION_ROWS if r[1] == x})
            for x in SORTED_XS}
+
+
+def first_duplicate_xy():
+    """Return the first duplicated (x, y) calibration key and the SL values it spans."""
+    seen = {}
+    for sl, x, y, *_ in sorted(CALIBRATION_ROWS, key=lambda r: r[0]):
+        key = (x, y)
+        if key in seen:
+            return key, seen[key], sl
+        seen[key] = sl
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +158,19 @@ def select_object(detections):
     return best_i, detections[best_i]
 
 
+def round_half_toward_zero(v):
+    """Round to nearest int; frac > 0.5 away from zero, else toward zero.
+
+    30.6->31, 30.2->30, 30.5->30, -2.3->-2, -3.7->-4, -2.5->-2.
+    """
+    fv = float(v)
+    ax = abs(fv)
+    fl = math.floor(ax)
+    frac = ax - fl
+    mag = fl + 1 if frac > 0.5 else fl
+    return int(mag) if fv >= 0 else -int(mag)
+
+
 def trunc_toward_zero(v):
     """Round toward zero: 2.8->2, -2.8->-2. Equivalent to math.trunc."""
     return math.trunc(float(v))
@@ -182,8 +213,8 @@ def pick_from_detections(detections):
     """
     idx, det = select_object(detections)
     x_raw, y_raw = _xy_of(det)  # Z ignored: never read
-    x_proc = trunc_toward_zero(x_raw)
-    y_proc = trunc_toward_zero(y_raw)
+    x_proc = round_half_toward_zero(x_raw)
+    y_proc = round_half_toward_zero(y_raw)
     x_map = map_x(x_proc)
     if x_map is None:
         raise ValueError(
@@ -211,10 +242,18 @@ def _demo():
          [{"x": 29.0, "y": -5.0}, {"x": 29.0, "y": -2.0}, {"x": 31.0, "y": 0.0}]),
         ("spec Y-tie: X_map=29 Y_proc=-3 -> -4 wins (smaller Y)",
          [{"x": 29.2, "y": -3.2}]),
-        ("trunc demo: 29.7 -> 29; floor 31.8 -> 31",
-         [{"x": 31.8, "y": -1.2}]),
-        ("negative trunc: -2.8 -> -2",
-         [{"x": 26.9, "y": -2.8}]),
+        ("round up: 30.6 -> 31",
+         [{"x": 30.6, "y": -1.2}]),
+        ("round down: 30.2 -> 30",
+         [{"x": 30.2, "y": -1.2}]),
+        ("round tie: 30.5 -> 30",
+         [{"x": 30.5, "y": 1.1}]),
+        ("negative round: -2.3 -> -2",
+         [{"x": 26.9, "y": -2.3}]),
+        ("negative round: -3.7 -> -4",
+         [{"x": 26.9, "y": -3.7}]),
+        ("negative tie: -2.5 -> -2",
+         [{"x": 26.9, "y": -2.5}]),
     ]
     for name, dets in cases:
         try:
@@ -227,8 +266,16 @@ def _demo():
                   f"upper={r['upper_deg']}")
         except ValueError as e:
             print(f"[{name}] ERROR: {e}")
-    print(f"Calibration X range {SORTED_XS[0]}..{SORTED_XS[-1]}; "
-          f"duplicate (23,-6) resolves to first SL row {ROW_BY_XY[(23, -6)]}")
+
+    dup = first_duplicate_xy()
+    if dup is not None:
+        key, first_sl, later_sl = dup
+        print(f"Calibration X range {SORTED_XS[0]}..{SORTED_XS[-1]}; "
+              f"duplicate ({key[0]},{key[1]}) resolves to first SL row {first_sl} "
+              f"(later row {later_sl} is ignored)")
+    else:
+        print(f"Calibration X range {SORTED_XS[0]}..{SORTED_XS[-1]}; "
+              "no duplicate XY calibration keys found")
 
 
 def _live():
@@ -286,13 +333,53 @@ def _live():
     cv2.destroyAllWindows()
 
 
-def _run_once():
-    """Default mode: one-shot capture (cam on/off) -> angles.
+def build_serial_payload(marker_id, lower_deg, base_deg, upper_deg):
+    """Return a single Arduino command payload: id,lower,base,upper."""
+    return f"{int(marker_id)},{int(lower_deg)},{int(base_deg)},{int(upper_deg)}\n".encode("ascii")
+
+
+def send_to_arduino(marker_id, lower_deg, base_deg, upper_deg,
+                    serial_port=None, baud_rate=9600, timeout=2.0):
+    """Open a serial port, send one payload, and close it immediately.
+
+    The Arduino is expected to parse one CSV message on the form:
+    id,lower,base,upper
+
+    The ``with`` block guarantees the port is closed right after the
+    single write, per the pick-cycle spec (send once -> close).
+    """
+    if serial is None:
+        raise RuntimeError("pyserial is not installed. Install it with: pip install pyserial")
+
+    port = serial_port or "/dev/ttyUSB0"
+    if not Path(port).exists() and port.startswith("/dev/"):
+        alt_ports = ["/dev/ttyACM0", "/dev/ttyACM1"]
+        for alt in alt_ports:
+            if Path(alt).exists():
+                port = alt
+                break
+
+    payload = build_serial_payload(marker_id, lower_deg, base_deg, upper_deg)
+    with serial.Serial(port, baud_rate, timeout=timeout) as ser:
+        # Arduino Uno/Mega auto-resets on serial open and needs ~2 s
+        # for the bootloader + setup() (claw open + go home) before
+        # it can receive. Sending earlier loses the payload.
+        time.sleep(2.0)
+        ser.reset_input_buffer()
+        ser.write(payload)
+        ser.flush()
+        time.sleep(0.2)
+    return port
+
+
+def _run_once(serial_port=None, baud_rate=9600):
+    """Default mode: one-shot capture (cam on/off) -> angles -> Arduino.
 
     1. Camera ON: aruco_base_relative.capture_best_target() averages
        10 frames, drops id 1, selects smallest-x (tie: closest to
        origin), returns {id, x, y, z} averages, then closes the camera.
     2. Camera OFF: map that single detection to servo angles.
+    3. Send the final command to the Arduino once, then close the serial port.
     Runs exactly once, then exits.
     """
     from aruco_base_relative import capture_best_target
@@ -310,7 +397,7 @@ def _run_once():
           f"(camera now off).")
     try:
         # Single-element list: selection already done; this only
-        # truncates + floor/nearest maps + table lookup.
+        # rounds + floor/nearest maps + table lookup.
         r = pick_from_detections([target])
     except ValueError as e:
         print(f"id={tid} ERROR: {e}")
@@ -321,6 +408,15 @@ def _run_once():
           f"lower={r['lower_deg']} base={r['base_deg']} "
           f"upper={r['upper_deg']}")
 
+    try:
+        port = send_to_arduino(tid, r["lower_deg"], r["base_deg"], r["upper_deg"],
+                               serial_port=serial_port, baud_rate=baud_rate)
+        print(f"Serial command sent to Arduino on {port}: "
+              f"id={tid}, lower={r['lower_deg']}, base={r['base_deg']}, upper={r['upper_deg']} "
+              f"(serial port now closed)")
+    except Exception as exc:
+        print(f"Serial send failed: {exc}")
+
 
 if __name__ == "__main__":
     import sys
@@ -329,4 +425,10 @@ if __name__ == "__main__":
     elif "--live" in sys.argv:
         _live()
     else:
-        _run_once()
+        _port, _baud = None, 9600
+        for _a in sys.argv[1:]:
+            if _a.startswith("--port="):
+                _port = _a.split("=", 1)[1]
+            elif _a.startswith("--baud="):
+                _baud = int(_a.split("=", 1)[1])
+        _run_once(serial_port=_port, baud_rate=_baud)
