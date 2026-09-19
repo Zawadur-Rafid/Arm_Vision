@@ -85,14 +85,24 @@ CALIBRATION_ROWS = [
 
 # Precomputed lookup structures.
 SORTED_XS = sorted({r[1] for r in CALIBRATION_ROWS})
-# (x, y) -> first row with that key (lowest SL wins on duplicates,
-# e.g. (23, -6) appears as SL16 and SL40; SL16 is kept).
+# (x, y) -> first row with that key (lowest SL wins on duplicates).
 ROW_BY_XY = {}
 for _sl, _x, _y, _lo, _ba, _up in sorted(CALIBRATION_ROWS, key=lambda r: r[0]):
     ROW_BY_XY.setdefault((_x, _y), (_lo, _ba, _up))
 # x -> sorted unique y values present for that x.
 YS_BY_X = {x: sorted({r[2] for r in CALIBRATION_ROWS if r[1] == x})
            for x in SORTED_XS}
+
+
+def first_duplicate_xy():
+    """Return the first duplicated (x, y) calibration key and the SL values it spans."""
+    seen = {}
+    for sl, x, y, *_ in sorted(CALIBRATION_ROWS, key=lambda r: r[0]):
+        key = (x, y)
+        if key in seen:
+            return key, seen[key], sl
+        seen[key] = sl
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -227,8 +237,16 @@ def _demo():
                   f"upper={r['upper_deg']}")
         except ValueError as e:
             print(f"[{name}] ERROR: {e}")
-    print(f"Calibration X range {SORTED_XS[0]}..{SORTED_XS[-1]}; "
-          f"duplicate (23,-6) resolves to first SL row {ROW_BY_XY[(23, -6)]}")
+
+    dup = first_duplicate_xy()
+    if dup is not None:
+        key, first_sl, later_sl = dup
+        print(f"Calibration X range {SORTED_XS[0]}..{SORTED_XS[-1]}; "
+              f"duplicate ({key[0]},{key[1]}) resolves to first SL row {first_sl} "
+              f"(later row {later_sl} is ignored)")
+    else:
+        print(f"Calibration X range {SORTED_XS[0]}..{SORTED_XS[-1]}; "
+              "no duplicate XY calibration keys found")
 
 
 def _live():
